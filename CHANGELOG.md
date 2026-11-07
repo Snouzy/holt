@@ -4,6 +4,75 @@ Notable changes to Holt. The format follows [Keep a Changelog](https://keepachan
 
 ## [Unreleased]
 
+### Added
+
+- Drag an edge or a corner of the popup to resize it, to see more clips at once. Holt keeps the size, and Settings → General shows it with a Reset button.
+- Settings → General → Single click on a clip: keep selecting it, or copy it to the clipboard. A double click still pastes.
+
+### Changed
+
+- Hovering a row in the popup lifts it and selects it, so the preview follows the pointer.
+
+## [0.1.7] - 2026-10-28
+
+The ⌘I panel in plain words.
+
+### Changed
+
+- The ⌘I panel says whether a clip came over the same network, over the internet or through a relay, in one line per arrival. Hover over a line for the exact time and address.
+
+### Fixed
+
+- ⌘, opens Settings while the popup is open.
+
+## [0.1.6] - 2026-10-28
+
+See how a clip got to your Mac.
+
+### Added
+
+- Press ⌘I in the popup to see when and where a clip was copied, and how it reached this Mac: through Universal Clipboard, or from a paired device directly or through a relay, and how long that took.
+
+## [0.1.5] - 2026-10-28
+
+Images work the way you'd expect: from Finder, from your iPhone, and the right way up.
+
+### Added
+
+- Copy an image file in Finder and Holt keeps the picture, not the file name.
+- The preview shows images larger. While you search, it shows the text found in the image, with your words in bold.
+- Copies that arrive through Universal Clipboard say so, instead of naming the app that was in front.
+
+### Fixed
+
+- Photos from an iPhone are measured and pasted the right way up. Before, most apps got them sideways.
+- Image rows are titled by their size, instead of the text read in them.
+- A clip copied seconds ago says "just now", not "in 0 seconds".
+
+## [0.1.4] - 2026-10-28
+
+Holt keeps the images you copy now, and works from Alfred.
+
+### Added
+
+- Screenshots and images you copy are kept in your history, and search finds them by the text in them. Turn it off in Settings → History.
+- Press Space on an image in the popup or the menu bar menu to see it full size. ⌘O opens it in Preview.
+- Drag a clip out of the popup or the menu bar menu into any app.
+- Images sync to your other devices once they run this version too.
+- An Alfred workflow. Type `holt` in Alfred to search your history and paste from it. It needs Alfred's Powerpack.
+
+## [0.1.3] - 2026-10-27
+
+Clips you save from Raycast now sync too.
+
+### Changed
+
+- The update window shows what's new in the release, instead of opening the GitHub page.
+
+### Fixed
+
+- Clips that the Raycast extension adds reach your other devices right away. Before, they waited until you copied something on the Mac.
+
 ## [0.1.2] - 2026-10-27
 
 Holt for Mac is ready for the iPhone app, which is in testing now.
@@ -45,7 +114,12 @@ The first release. Holt keeps everything you copy on your Mac, and pairs your Ma
 - A first-launch checklist for the permissions Holt needs, and a setting to open Holt at login.
 - Settings to change the shortcut and choose how long to keep history.
 
-[Unreleased]: https://github.com/snowztech/holt/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/snowztech/holt/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/snowztech/holt/releases/tag/v0.1.7
+[0.1.6]: https://github.com/snowztech/holt/releases/tag/v0.1.6
+[0.1.5]: https://github.com/snowztech/holt/releases/tag/v0.1.5
+[0.1.4]: https://github.com/snowztech/holt/releases/tag/v0.1.4
+[0.1.3]: https://github.com/snowztech/holt/releases/tag/v0.1.3
 [0.1.2]: https://github.com/snowztech/holt/releases/tag/v0.1.2
 [0.1.1]: https://github.com/snowztech/holt/releases/tag/v0.1.1
 [0.1.0]: https://github.com/snowztech/holt/releases/tag/v0.1.0

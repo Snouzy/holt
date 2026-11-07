@@ -14,13 +14,19 @@ final class PopupModel: ObservableObject {
     @Published var query = "" { didSet { selection = 0; refresh() } }
     @Published private(set) var clips: [Clip] = []
     @Published var selection = 0
+    /// Set when the pointer picked the row: it's already on screen, so the list doesn't scroll.
+    var selectedByPointer = false
     /// The app that will receive the paste, shown in the action bar.
     @Published private(set) var targetApp: String?
     @Published private(set) var sync: SyncStatus?
     /// ⌘1 to ⌘9 hints show only while ⌘ is held.
     @Published var commandHeld = false
+    /// The clip a single click just copied, marked for a moment in the list.
+    @Published private(set) var copiedID: Int64?
     /// Bumped on every show so the view can refocus the search field.
     @Published private(set) var shown = 0
+    /// ⌘I: where the selected clip was copied and how it got here. Stays on until ⌘I again.
+    @Published var showInfo = false
 
     private let store: Store
     private let syncStatus: () -> SyncStatus?
@@ -49,6 +55,20 @@ final class PopupModel: ObservableObject {
         selection = min(selection, max(clips.count - 1, 0))
     }
 
+    func markCopied(_ clip: Clip) {
+        let id = clip.id
+        copiedID = id
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            if self?.copiedID == id { self?.copiedID = nil }
+        }
+    }
+
+    func point(at index: Int) {
+        guard index != selection, clips.indices.contains(index) else { return }
+        selectedByPointer = true
+        selection = index
+    }
+
     func move(_ delta: Int) {
         guard !clips.isEmpty else { return }
         selection = min(max(selection + delta, 0), clips.count - 1)
@@ -60,6 +80,10 @@ final class PopupModel: ObservableObject {
         refresh()
     }
 
+    func arrivals(_ clip: Clip) -> [Arrival] {
+        (try? store.arrivals(id: clip.id)) ?? []
+    }
+
     func deleteSelected() {
         guard let clip = selected else { return }
         try? store.delete(id: clip.id)
@@ -69,8 +93,78 @@ final class PopupModel: ObservableObject {
 
 /// Floating panel that takes the keyboard without activating Holt, so the app
 /// the user was typing in stays frontmost and gets the paste.
-private final class PopupPanel: NSPanel {
+final class PopupPanel: NSPanel {
     override var canBecomeKey: Bool { true }
+
+    private var pressedRow: DragSource.DragView?
+    /// Where the pointer was when the popup opened. A row under a still pointer
+    /// doesn't take the selection, or ↩ would paste something else than the first clip.
+    var pointerAtOpen: NSPoint?
+
+    var pointerHasMoved: Bool {
+        guard let pointerAtOpen else { return true }
+        if NSEvent.mouseLocation == pointerAtOpen { return false }
+        self.pointerAtOpen = nil
+        return true
+    }
+
+    /// SwiftUI's scroll view keeps every click for itself, so AppKit views in
+    /// the rows never see one. Mouse events are handed to the row under the
+    /// cursor here instead.
+    override func sendEvent(_ event: NSEvent) {
+        switch event.type {
+        case .leftMouseDown:
+            if let row = row(at: event.locationInWindow) {
+                pressedRow = row
+                row.mouseDown(with: event)
+                return
+            }
+        case .leftMouseDragged:
+            if let pressedRow {
+                pressedRow.mouseDragged(with: event)
+                return
+            }
+        case .leftMouseUp:
+            if let pressedRow {
+                self.pressedRow = nil
+                pressedRow.mouseUp(with: event)
+                return
+            }
+        case .scrollWheel:
+            // Rows that scroll under a still pointer get no enter or exit. Checked
+            // once the scroll view has moved them.
+            super.sendEvent(event)
+            DispatchQueue.main.async { [weak self] in self?.refreshHover() }
+            return
+        default:
+            break
+        }
+        super.sendEvent(event)
+    }
+
+    /// Highlights the row under the pointer, if any.
+    func refreshHover() {
+        guard let contentView else { return }
+        rows(in: contentView).forEach { $0.refreshHover() }
+    }
+
+    /// The keyboard took over, or the popup closed: no row stays highlighted
+    /// until the pointer moves again.
+    func clearHover() {
+        guard let contentView else { return }
+        rows(in: contentView).forEach { $0.setHovered(false) }
+    }
+
+    private func row(at point: NSPoint) -> DragSource.DragView? {
+        guard let contentView else { return nil }
+        return rows(in: contentView).first { row in
+            row.bounds.intersection(row.visibleRect).contains(row.convert(point, from: nil))
+        }
+    }
+
+    private func rows(in view: NSView) -> [DragSource.DragView] {
+        view.subviews.flatMap { ($0 as? DragSource.DragView).map { [$0] } ?? rows(in: $0) }
+    }
 }
 
 @MainActor
@@ -78,14 +172,21 @@ final class PopupController {
     private let panel: PopupPanel
     private let model: PopupModel
     private let onPick: (Clip) -> Void
+    private let onCopy: (Clip) -> Void
+    /// ⌘, opens Settings. The popup never activates Holt, so the app menu's own ⌘, never fires here.
+    var onSettings: (() -> Void)?
+    private let lightbox = Lightbox()
     private var keyMonitor: Any?
 
-    init(store: Store, syncStatus: @escaping () -> SyncStatus?, onPick: @escaping (Clip) -> Void) {
+    init(
+        store: Store, syncStatus: @escaping () -> SyncStatus?, onPick: @escaping (Clip) -> Void, onCopy: @escaping (Clip) -> Void
+    ) {
         self.onPick = onPick
+        self.onCopy = onCopy
         model = PopupModel(store: store, syncStatus: syncStatus)
         panel = PopupPanel(
             contentRect: NSRect(x: 0, y: 0, width: 760, height: 460),
-            styleMask: [.nonactivatingPanel, .titled, .fullSizeContentView],
+            styleMask: [.nonactivatingPanel, .titled, .fullSizeContentView, .resizable],
             backing: .buffered,
             defer: false
         )
@@ -95,10 +196,26 @@ final class PopupController {
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isReleasedWhenClosed = false
+        // Drag an edge to resize; the size is kept for next time.
+        panel.contentMinSize = Prefs.minPopupSize
         for button in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
             panel.standardWindowButton(button)?.isHidden = true
         }
-        panel.contentView = NSHostingView(rootView: PopupView(model: model, onPick: { [weak self] in self?.onPick($0) }))
+        panel.contentView = NSHostingView(
+            rootView: PopupView(
+                model: model,
+                onPick: { [weak self] in self?.onPick($0) },
+                onCopy: { [weak self] in self?.onCopy($0) },
+                canPreview: { [weak self] in self?.canPreview ?? false },
+                onHover: { [weak self] in self?.followSelection() }))
+        lightbox.onDismiss = { [weak self] in self?.lightbox.hide() }
+        NotificationCenter.default.addObserver(forName: NSWindow.didEndLiveResizeNotification, object: panel, queue: .main) {
+            [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                Prefs.popupSize = self.panel.frame.size
+            }
+        }
 
         NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: panel, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.close() }
@@ -116,9 +233,16 @@ final class PopupController {
         let mouse = NSEvent.mouseLocation
         let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main
         if let frame = screen?.visibleFrame {
-            let size = panel.frame.size
-            panel.setFrameOrigin(NSPoint(x: frame.midX - size.width / 2, y: frame.minY + frame.height * 0.62 - size.height / 2))
+            // The saved size, read on every show so Reset in Settings applies, and
+            // never bigger than this screen.
+            let saved = Prefs.popupSize
+            let size = NSSize(
+                width: min(max(saved.width, Prefs.minPopupSize.width), frame.width),
+                height: min(max(saved.height, Prefs.minPopupSize.height), frame.height))
+            let y = min(max(frame.minY + frame.height * 0.62 - size.height / 2, frame.minY), frame.maxY - size.height)
+            panel.setFrame(NSRect(x: frame.midX - size.width / 2, y: y, width: size.width, height: size.height), display: false)
         }
+        panel.pointerAtOpen = NSEvent.mouseLocation
         panel.makeKeyAndOrderFront(nil)
         if keyMonitor == nil {
             keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
@@ -128,9 +252,33 @@ final class PopupController {
     }
 
     func close() {
+        lightbox.hide()
+        panel.clearHover()
         panel.orderOut(nil)
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
         keyMonitor = nil
+    }
+
+    /// Space shows the selected image full size, as in Finder. Only while the
+    /// search field is empty, so a space in a query stays a space.
+    private var canPreview: Bool { model.query.isEmpty && model.selected?.image != nil }
+
+    private func togglePreview() {
+        if lightbox.isVisible {
+            lightbox.hide()
+        } else if let image = model.selected?.image {
+            lightbox.show(image, over: panel)
+        }
+    }
+
+    /// Keeps the full-size view on the selected clip as ↑↓ move through the list.
+    private func followSelection() {
+        guard lightbox.isVisible else { return }
+        if canPreview, let image = model.selected?.image {
+            lightbox.show(image, over: panel)
+        } else {
+            lightbox.hide()
+        }
     }
 
     /// Picks up clips that arrive from another device while the popup is open.
@@ -145,17 +293,24 @@ final class PopupController {
             model.commandHeld = command
             return event
         }
+        panel.clearHover()
         switch Int(event.keyCode) {
-        case 125: model.move(1)  // ↓
-        case 126: model.move(-1)  // ↑
+        case 125: model.move(1); followSelection()  // ↓
+        case 126: model.move(-1); followSelection()  // ↑
         case 36, 76: if let clip = model.selected { onPick(clip) }  // return, enter
-        case 53: close()  // esc
+        case 53: lightbox.isVisible ? lightbox.hide() : close()  // esc
+        case 49 where canPreview: togglePreview()  // space
         case 51 where command: model.deleteSelected()  // ⌘⌫
         default:
             guard command, let key = event.charactersIgnoringModifiers else { return event }
             if key == "p" {
                 model.togglePin()
-            } else if key == "o", let clip = model.selected, clip.kind == .link, let url = linkURL(clip) {
+            } else if key == "i" {
+                model.showInfo.toggle()
+            } else if key == "," {
+                close()
+                onSettings?()
+            } else if key == "o", let clip = model.selected, let url = openURL(clip) {
                 close()
                 NSWorkspace.shared.open(url)
             } else if let n = Int(key), (1...9).contains(n), model.clips.indices.contains(n - 1) {
@@ -168,9 +323,91 @@ final class PopupController {
     }
 }
 
+/// The selected image full size, over the popup. Not Quick Look: that panel
+/// only shows for the active app, and Holt stays inactive so the app the user
+/// was in keeps the paste.
+@MainActor
+final class Lightbox {
+    private let panel: NSPanel
+    var onDismiss: (() -> Void)?
+
+    init() {
+        panel = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.level = .floating
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.isReleasedWhenClosed = false
+    }
+
+    var isVisible: Bool { panel.isVisible }
+
+    /// Sized to the image at 1:1 on this screen, or to fit the screen, whichever is smaller.
+    func show(_ image: ImageInfo, over popup: NSWindow) {
+        guard let screen = popup.screen ?? NSScreen.main else { return }
+        show(image, on: screen, fraction: 1, above: popup)
+    }
+
+    /// `fraction` is how much of the screen the view may take.
+    func show(_ image: ImageInfo, on screen: NSScreen, fraction: CGFloat, above window: NSWindow? = nil) {
+        let visible = screen.visibleFrame.insetBy(dx: 40, dy: 40)
+        let room = visible.insetBy(dx: visible.width * (1 - fraction) / 2, dy: visible.height * (1 - fraction) / 2)
+        let natural = NSSize(
+            width: CGFloat(image.width) / screen.backingScaleFactor, height: CGFloat(image.height) / screen.backingScaleFactor)
+        let fit = min(room.width / max(natural.width, 1), room.height / max(natural.height, 1), 1)
+        let size = NSSize(width: max(natural.width * fit, 160), height: max(natural.height * fit, 100))
+        panel.contentView = NSHostingView(rootView: LightboxView(image: image, onTap: { [weak self] in self?.onDismiss?() }))
+        panel.setFrame(
+            NSRect(x: room.midX - size.width / 2, y: room.midY - size.height / 2, width: size.width, height: size.height), display: true)
+        // Ordered, never made key: the popup keeps the keyboard.
+        if let window {
+            panel.order(.above, relativeTo: window.windowNumber)
+        } else {
+            panel.orderFrontRegardless()
+        }
+    }
+
+    func hide() {
+        panel.orderOut(nil)
+        panel.contentView = nil
+    }
+}
+
+private struct LightboxView: View {
+    let image: ImageInfo
+    let onTap: () -> Void
+    @State private var loaded: NSImage?
+
+    var body: some View {
+        ZStack {
+            if let picture = loaded ?? NSImage(data: image.thumb) {
+                Image(nsImage: picture)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(.regularMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(.white.opacity(0.1)))
+        .contentShape(Rectangle())
+        .onTapGesture { onTap() }
+        .task(id: image.path) {
+            let path = image.path
+            let picture = await Task.detached(priority: .userInitiated) { Images.preview(path: path, maxPixels: 5000) }.value
+            if !Task.isCancelled { loaded = picture }
+        }
+    }
+}
+
 struct PopupView: View {
     @ObservedObject var model: PopupModel
     let onPick: (Clip) -> Void
+    let onCopy: (Clip) -> Void
+    let canPreview: () -> Bool
+    /// The pointer moved the selection: the full-size view follows it.
+    var onHover: () -> Void = {}
     @FocusState private var searchFocused: Bool
 
     var body: some View {
@@ -195,13 +432,14 @@ struct PopupView: View {
                     list
                     Divider()
                     if let clip = model.selected {
-                        ClipPreview(clip: clip).frame(width: 300)
+                        ClipPreview(clip: clip, query: model.query, info: model.showInfo ? model.arrivals(clip) : nil)
+                            .frame(width: 300)
                     }
                 }
             }
 
             Divider()
-            ActionBar(clip: model.selected, targetApp: model.targetApp, sync: model.sync)
+            ActionBar(clip: model.selected, targetApp: model.targetApp, sync: model.sync, canPreview: canPreview())
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.regularMaterial)
@@ -224,24 +462,63 @@ struct PopupView: View {
                                 .padding(.top, index == 0 ? 4 : 12)
                                 .padding(.bottom, 4)
                         }
-                        ClipRow(
+                        HoverRow(
                             clip: clip,
                             number: model.commandHeld && index < 9 ? index + 1 : nil,
                             query: model.query,
-                            selected: index == model.selection
+                            selected: index == model.selection,
+                            copied: model.copiedID == clip.id,
+                            onClick: {
+                                model.selection = index
+                                // The popup stays open, so a second click can still paste.
+                                if Prefs.clickToCopy {
+                                    onCopy(clip)
+                                    model.markCopied(clip)
+                                }
+                            },
+                            onDoubleClick: { onPick(clip) },
+                            onHover: {
+                                model.point(at: index)
+                                onHover()
+                            }
                         )
                         .id(clip.id)
-                        .contentShape(Rectangle())
-                        .onTapGesture(count: 2) { onPick(clip) }
-                        .onTapGesture { model.selection = index }
                     }
                 }
                 .padding(8)
             }
             .onChange(of: model.selection) {
-                if let clip = model.selected { proxy.scrollTo(clip.id) }
+                defer { model.selectedByPointer = false }
+                if !model.selectedByPointer, let clip = model.selected { proxy.scrollTo(clip.id) }
             }
         }
+    }
+}
+
+/// A row and its pointer state. The state lives here, not in the model, so
+/// moving the pointer redraws two rows instead of the whole list.
+private struct HoverRow: View {
+    let clip: Clip
+    let number: Int?
+    let query: String
+    let selected: Bool
+    let copied: Bool
+    let onClick: () -> Void
+    let onDoubleClick: () -> Void
+    let onHover: () -> Void
+    @State private var hovered = false
+
+    var body: some View {
+        ClipRow(clip: clip, number: number, query: query, selected: selected, copied: copied, hovered: hovered)
+            .overlay(
+                DragSource(
+                    clip: clip,
+                    onClick: onClick,
+                    onDoubleClick: onDoubleClick,
+                    onHover: {
+                        hovered = $0
+                        if $0 { onHover() }
+                    }))
     }
 }
 
@@ -250,11 +527,18 @@ private struct ClipRow: View {
     let number: Int?
     let query: String
     let selected: Bool
+    var copied = false
+    var hovered = false
 
     var body: some View {
         HStack(spacing: 10) {
             SourceIcon(clip: clip).frame(width: 18, height: 18)
-            Text(highlight(oneLine(clip.text), query))
+            if let image = clip.image {
+                Thumbnail(data: image.thumb, maxWidth: 40, maxHeight: 24)
+            }
+            // An image's recognized text is for search and the preview. As a title it's
+            // mostly noise, especially on photos.
+            Text(highlight(clip.image.map(imageLabel) ?? oneLine(clip.text), query))
                 .font(.system(size: 13.5))
                 .lineLimit(1)
                 .truncationMode(.tail)
@@ -268,7 +552,12 @@ private struct ClipRow: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
-            if let number {
+            if copied {
+                Text("Copied")
+                    .font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                    .foregroundStyle(Brand.river)
+                    .transition(.opacity)
+            } else if let number {
                 Text("⌘\(number)")
                     .font(.system(size: 11.5, weight: .medium, design: .rounded))
                     .foregroundStyle(Brand.river)
@@ -283,15 +572,22 @@ private struct ClipRow: View {
         .padding(.horizontal, 10)
         .frame(height: 32)
         .background {
-            if selected {
-                RoundedRectangle(cornerRadius: 7, style: .continuous).fill(Brand.river.opacity(0.2))
-            }
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(Brand.river.opacity(selected ? 0.2 : hovered ? 0.1 : 0))
+                .shadow(color: .black.opacity(hovered ? 0.18 : 0), radius: hovered ? 6 : 0, y: hovered ? 2 : 0)
         }
+        // The hovered row rises a little above the list. Only the pointer animates: ↑↓ stay instant.
+        .scaleEffect(hovered ? 1.012 : 1)
+        .animation(.spring(duration: 0.18, bounce: 0.25), value: hovered)
+        .zIndex(hovered ? 1 : 0)
     }
 }
 
 private struct ClipPreview: View {
     let clip: Clip
+    let query: String
+    /// How the clip got here, when ⌘I is on.
+    let info: [Arrival]?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -300,7 +596,27 @@ private struct ClipPreview: View {
                 Text(meta).font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(1)
             }
 
-            if clip.kind == .link {
+            if let image = clip.image {
+                // Takes the room the text below doesn't need.
+                ImagePreview(image: image).layoutPriority(1)
+                Text("\(dimensions(image)) · \(image.format.uppercased()) · \(fileSize(image.bytes))")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+                // The recognized text shows why a search matched. Browsing, the picture says enough.
+                if let excerpt = recognizedExcerpt {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Text in image").font(.system(size: 11, weight: .medium)).foregroundStyle(.tertiary)
+                        // A few lines, not selectable: laying out a screenshot's worth of
+                        // recognized text costs hundreds of milliseconds per keypress.
+                        Text(highlight(excerpt, query))
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                            .lineSpacing(2)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                Spacer(minLength: 0)
+            } else if clip.kind == .link {
                 linkCard
                 Spacer(minLength: 0)
             } else if isShort {
@@ -318,12 +634,25 @@ private struct ClipPreview: View {
                 }
                 Text(size).font(.system(size: 11)).foregroundStyle(.tertiary)
             }
+            if let info {
+                ClipInfo(clip: clip, arrivals: info)
+            }
         }
         .padding(18)
         .frame(maxHeight: .infinity, alignment: .top)
     }
 
     private var lineCount: Int { clip.text.split(whereSeparator: \.isNewline).count }
+
+    /// While searching, the lines that match first.
+    private var recognizedExcerpt: String? {
+        let words = query.lowercased().split(whereSeparator: \.isWhitespace)
+        guard !words.isEmpty, !clip.text.isEmpty else { return nil }
+        let lines = clip.text.split(whereSeparator: \.isNewline)
+        let matching = lines.filter { line in words.contains { line.lowercased().contains($0) } }
+        let shown = (matching.isEmpty ? lines : matching).prefix(6)
+        return shown.map { String($0.prefix(120)) }.joined(separator: "\n")
+    }
     private var isShort: Bool { lineCount <= 1 && clip.text.count <= 90 }
 
     private var meta: String {
@@ -356,6 +685,7 @@ private struct ActionBar: View {
     let clip: Clip?
     let targetApp: String?
     let sync: SyncStatus?
+    let canPreview: Bool
 
     var body: some View {
         HStack(spacing: 18) {
@@ -369,7 +699,8 @@ private struct ActionBar: View {
             }
             Spacer()
             if let clip {
-                if clip.kind == .link { action("Open", "⌘O") }
+                if canPreview { action("Full size", "␣") }
+                if openURL(clip) != nil { action("Open", "⌘O") }
                 action(clip.pinned ? "Unpin" : "Pin", "⌘P")
                 action("Delete", "⌘⌫")
                 action(targetApp.map { "Paste in \($0)" } ?? "Paste", "↩", primary: true)
@@ -417,8 +748,161 @@ struct SourceIcon: View {
         if let icon = AppInfo.icon(clip.sourceApp) {
             Image(nsImage: icon).resizable()
         } else {
-            Image(systemName: clip.kind == .link ? "link" : "text.alignleft")
+            Image(systemName: fallback)
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    private var fallback: String {
+        switch clip.kind {
+        case .link: "link"
+        case .image: "photo"
+        case .text: "text.alignleft"
+        }
+    }
+}
+
+/// ⌘I: where a clip was copied, and each time it reached this Mac from a paired
+/// device: on the same network, over the internet or through a relay. For telling
+/// Universal Clipboard from Holt sync, and for seeing why a sync was slow.
+private struct ClipInfo: View {
+    let clip: Clip
+    let arrivals: [Arrival]
+
+    var body: some View {
+        Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 10, verticalSpacing: 5) {
+            GridRow {
+                label("Copied")
+                Text(copied)
+            }
+            ForEach(Array(arrivals.enumerated()), id: \.offset) { index, arrival in
+                GridRow {
+                    label(index == 0 ? "Arrived" : "")
+                    Text(describe(arrival)).help(details(arrival))
+                }
+            }
+        }
+        .font(.system(size: 11))
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+        .textSelection(.enabled)
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private func label(_ text: String) -> some View {
+        Text(text).foregroundStyle(.tertiary).gridColumnAlignment(.trailing)
+    }
+
+    private var copied: String {
+        let when = exactTime(date(clip))
+        if clip.sourceApp == ClipboardWatcher.universalClipboard { return "\(when), through Universal Clipboard" }
+        let app = AppInfo.name(clip.sourceApp).map { " in \($0)" } ?? ""
+        return "\(when) on \(clip.device ?? "this Mac")\(app)"
+    }
+
+    /// One line per arrival. The sender is named only when it isn't the device the
+    /// clip was copied on, like a Mac passing on your iPhone's copy.
+    private func describe(_ arrival: Arrival) -> String {
+        let sender = arrival.from == clip.device ? nil : "from \(arrival.from)"
+        let path: String? =
+            switch arrival.path {
+            case .sameNetwork: "same network"
+            case .internet: "over the internet"
+            case .relay: "via relay"
+            case nil: nil
+            }
+        let parts = [sender, path, delay(arrival.arrivedAt - arrival.copiedAt)].compactMap { $0 }
+        return parts.isEmpty ? "synced" : parts.joined(separator: " · ")
+    }
+
+    /// The hover text: what the path means, then the exact time and address for the curious.
+    private func details(_ arrival: Arrival) -> String {
+        let arrived = exactTime(Date(timeIntervalSince1970: TimeInterval(arrival.arrivedAt) / 1000))
+        let address = arrival.address.map { arrival.path == .relay ? " through \($0)" : " from \($0)" } ?? ""
+        return "\(explain(arrival.path))\n\nArrived at \(arrived)\(address)."
+    }
+
+    private func explain(_ path: ArrivalPath?) -> String {
+        switch path {
+        case .sameNetwork: "Sent straight to this Mac over the network you share. It never left it."
+        case .internet: "Sent straight to this Mac across the internet, end-to-end encrypted, with no server in between."
+        case .relay:
+            "The devices couldn't reach each other, so a relay server passed the clip along, encrypted. It can't read it. A router or firewall is usually in the way."
+        case nil: "Synced by Holt."
+        }
+    }
+
+    /// How long after the copy it got here. Clocks differ a little between devices,
+    /// so a negative gap says nothing.
+    private func delay(_ ms: Int64) -> String? {
+        guard ms >= 0 else { return nil }
+        if ms < 10_000 { return "\((Double(ms) / 1000).formatted(.number.precision(.fractionLength(1)))) s later" }
+        let formatter = DateComponentsFormatter()
+        formatter.unitsStyle = .full
+        formatter.maximumUnitCount = 1
+        return formatter.string(from: TimeInterval(ms / 1000)).map { "\($0) later" }
+    }
+
+    private func exactTime(_ date: Date) -> String {
+        Calendar.current.isDateInToday(date)
+            ? date.formatted(.dateTime.hour().minute().second())
+            : date.formatted(.dateTime.day().month(.abbreviated).hour().minute().second())
+    }
+}
+
+/// A clip's stored thumbnail, a few kilobytes, so the list never opens the file.
+private struct Thumbnail: View {
+    let data: Data
+    let maxWidth: CGFloat
+    let maxHeight: CGFloat
+
+    var body: some View {
+        if let image = NSImage(data: data) {
+            // A fixed box, filled: a tall screenshot would otherwise be a sliver.
+            Image(nsImage: image)
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+                .frame(width: maxWidth, height: maxHeight)
+                .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+        }
+    }
+}
+
+/// The image decoded for the preview pane, off the main thread and cached, with
+/// the thumbnail standing in while it loads.
+private struct ImagePreview: View {
+    let image: ImageInfo
+    @State private var loaded: NSImage?
+
+    private static let cache: NSCache<NSString, NSImage> = {
+        let cache = NSCache<NSString, NSImage>()
+        cache.countLimit = 12
+        return cache
+    }()
+
+    var body: some View {
+        Group {
+            if let picture = loaded ?? NSImage(data: image.thumb) {
+                Image(nsImage: picture)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .task(id: image.path) {
+            let key = image.path as NSString
+            if let cached = Self.cache.object(forKey: key) {
+                loaded = cached
+                return
+            }
+            let path = image.path
+            let picture = await Task.detached(priority: .userInitiated) { Images.preview(path: path, maxPixels: 1200) }.value
+            guard !Task.isCancelled, let picture else { return }
+            Self.cache.setObject(picture, forKey: key)
+            loaded = picture
         }
     }
 }
@@ -430,6 +914,7 @@ enum AppInfo {
 
     static func name(_ bundleID: String?) -> String? {
         guard let bundleID else { return nil }
+        if bundleID == ClipboardWatcher.universalClipboard { return "Universal Clipboard" }
         if let cached = names[bundleID] { return cached }
         let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)
         let name = url.map { FileManager.default.displayName(atPath: $0.path).replacingOccurrences(of: ".app", with: "") }
@@ -449,6 +934,134 @@ enum AppInfo {
 
 func linkURL(_ clip: Clip) -> URL? {
     URL(string: clip.text.trimmingCharacters(in: .whitespacesAndNewlines))
+}
+
+/// What ⌘O opens: the link, or the image file in Preview.
+func openURL(_ clip: Clip) -> URL? {
+    switch clip.kind {
+    case .link: linkURL(clip)
+    case .image: clip.image.map { URL(fileURLWithPath: $0.path) }
+    case .text: nil
+    }
+}
+
+/// Lets a row be dragged into another app, and still clicked. SwiftUI's own
+/// drag writes types only SwiftUI reads; AppKit's writes what the Finder, Mail
+/// and browsers expect.
+struct DragSource: NSViewRepresentable {
+    let clip: Clip
+    let onClick: () -> Void
+    let onDoubleClick: () -> Void
+    var onHover: (Bool) -> Void = { _ in }
+
+    func makeNSView(context: Context) -> DragView { DragView() }
+
+    func updateNSView(_ view: DragView, context: Context) {
+        view.clip = clip
+        view.onClick = onClick
+        view.onDoubleClick = onDoubleClick
+        view.onHover = onHover
+    }
+
+    final class DragView: NSView, NSDraggingSource {
+        var clip: Clip?
+        var onClick: (() -> Void)?
+        var onDoubleClick: (() -> Void)?
+        var onHover: ((Bool) -> Void)?
+        private var mouseDown: NSEvent?
+        private var dragging = false
+        private var isHovered = false
+
+        // Active always: the popup never activates Holt.
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            trackingAreas.forEach(removeTrackingArea)
+            addTrackingArea(
+                NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect], owner: self))
+        }
+
+        override func mouseEntered(with event: NSEvent) { setHovered(true) }
+        override func mouseExited(with event: NSEvent) { setHovered(false) }
+        // Brings the highlight back after the keyboard cleared it.
+        override func mouseMoved(with event: NSEvent) { setHovered(true) }
+
+        func refreshHover() {
+            guard let window, window.isVisible else { return setHovered(false) }
+            let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+            setHovered(bounds.intersection(visibleRect).contains(point))
+        }
+
+        func setHovered(_ hovered: Bool) {
+            if hovered, (window as? PopupPanel)?.pointerHasMoved == false { return }
+            guard hovered != isHovered else { return }
+            isHovered = hovered
+            onHover?(hovered)
+        }
+
+        // Otherwise a drag on a row moves the popup, which is movable by its background.
+        override var mouseDownCanMoveWindow: Bool { false }
+
+        override func mouseDown(with event: NSEvent) {
+            mouseDown = event
+            dragging = false
+        }
+
+        override func mouseDragged(with event: NSEvent) {
+            guard let mouseDown, !dragging, let clip,
+                hypot(event.locationInWindow.x - mouseDown.locationInWindow.x, event.locationInWindow.y - mouseDown.locationInWindow.y) > 4,
+                let writer = dragWriter(for: clip)
+            else { return }
+            dragging = true
+            let item = NSDraggingItem(pasteboardWriter: writer)
+            let image = dragImage(for: clip)
+            let origin = convert(mouseDown.locationInWindow, from: nil)
+            item.setDraggingFrame(
+                NSRect(
+                    x: origin.x - image.size.width / 2, y: origin.y - image.size.height / 2, width: image.size.width,
+                    height: image.size.height),
+                contents: image)
+            beginDraggingSession(with: [item], event: mouseDown, source: self)
+        }
+
+        override func mouseUp(with event: NSEvent) {
+            defer { mouseDown = nil }
+            guard !dragging else { return }
+            event.clickCount == 2 ? onDoubleClick?() : onClick?()
+        }
+
+        func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
+            .copy
+        }
+
+    }
+}
+
+/// What a dragged clip carries: the text as text; an image as its file, plus PNG and TIFF for apps
+/// that take a picture rather than a file.
+func dragWriter(for clip: Clip) -> NSPasteboardWriting? {
+    guard let image = clip.image else { return clip.text as NSString }
+    let url = URL(fileURLWithPath: image.path)
+    guard let bytes = try? Data(contentsOf: url) else { return nil }
+    let item = Images.pasteboardItem(bytes: bytes, format: image.format, sourceApp: clip.sourceApp)
+    item.setString(url.absoluteString, forType: .fileURL)
+    return item
+}
+
+func dragImage(for clip: Clip) -> NSImage {
+    if let image = clip.image, let thumb = NSImage(data: image.thumb) {
+        let scale = min(1, 160 / max(thumb.size.width, 1), 100 / max(thumb.size.height, 1))
+        thumb.size = NSSize(width: thumb.size.width * scale, height: thumb.size.height * scale)
+        return thumb
+    }
+    let text = oneLine(clip.text).prefix(60) as NSString
+    let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.labelColor]
+    let size = text.size(withAttributes: attributes)
+    return NSImage(size: NSSize(width: size.width + 16, height: size.height + 8), flipped: false) { rect in
+        NSColor.windowBackgroundColor.withAlphaComponent(0.9).setFill()
+        NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6).fill()
+        text.draw(at: NSPoint(x: 8, y: 4), withAttributes: attributes)
+        return true
+    }
 }
 
 private func date(_ clip: Clip) -> Date {
@@ -482,7 +1095,10 @@ private let relative: RelativeDateTimeFormatter = {
 }()
 
 private func longAge(_ clip: Clip) -> String {
-    relative.localizedString(for: date(clip), relativeTo: Date())
+    // Under a minute, or from a Mac whose clock runs ahead, it would read "in 0 seconds".
+    let now = Date()
+    let copied = min(date(clip), now)
+    return now.timeIntervalSince(copied) < 60 ? "just now" : relative.localizedString(for: copied, relativeTo: now)
 }
 
 func oneLine(_ text: String) -> String {

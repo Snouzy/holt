@@ -10,20 +10,21 @@
 //! and keeps sending as clips change.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iroh::address_lookup::{MemoryLookup, UserData};
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh::{Endpoint, EndpointId, RelayMode, SecretKey};
+use iroh::{Endpoint, EndpointId, RelayMode, SecretKey, TransportAddr};
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 use n0_future::StreamExt;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 use tokio::task::JoinHandle;
 
-use crate::{HoltError, Result, Row, Store};
+use crate::{ArrivalPath, Delivery, HoltError, Result, Row, Store};
 
 const SYNC_ALPN: &[u8] = b"holt/sync/1";
 const PAIR_ALPN: &[u8] = b"holt/pair/1";
@@ -346,7 +347,7 @@ async fn sync_session(inner: Arc<Inner>, conn: Connection, dialer: bool) -> NetR
     inner.set_online(peer, 1);
     let result = tokio::select! {
         r = send_changes(&inner, &mut send, &theirs, &peer_id) => r,
-        r = receive_changes(&inner, &mut recv, &theirs) => r,
+        r = receive_changes(&inner, &mut recv, &theirs, &conn, &peer_id) => r,
     };
     inner.set_online(peer, -1);
     result
@@ -379,7 +380,12 @@ async fn send_changes(
                 *seen = (*seen).max(last);
             }
         }
-        changes.changed().await?;
+        // Another process can write to the same database without waking this one,
+        // like an iPhone's share sheet or Control Center button, so look again now and then.
+        tokio::select! {
+            r = changes.changed() => r?,
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+        }
     }
 }
 
@@ -387,6 +393,8 @@ async fn receive_changes(
     inner: &Inner,
     recv: &mut RecvStream,
     theirs: &Mutex<HashMap<String, i64>>,
+    conn: &Connection,
+    peer_id: &str,
 ) -> NetResult<()> {
     loop {
         if let SyncMsg::Rows(rows) = read_msg(recv).await? {
@@ -398,7 +406,63 @@ async fn receive_changes(
                     *seen = (*seen).max(row.seq);
                 }
             }
-            inner.store.apply(rows)?;
+            inner
+                .store
+                .apply(rows, Some(&delivery(inner, conn, peer_id)))?;
+        }
+    }
+}
+
+/// The path the connection is using right now, so each clip can say how it got here.
+fn delivery(inner: &Inner, conn: &Connection, peer_id: &str) -> Delivery {
+    let paths = conn.paths();
+    let selected = paths
+        .iter()
+        .find(|p| p.is_selected())
+        .map(|p| p.remote_addr().clone());
+    let (path, address) = match selected {
+        Some(TransportAddr::Relay(url)) => {
+            (Some(ArrivalPath::Relay), url.host_str().map(String::from))
+        }
+        Some(TransportAddr::Ip(addr)) => {
+            let ours: Vec<IpAddr> = inner.endpoint.addr().ip_addrs().map(|a| a.ip()).collect();
+            let path = if on_this_network(addr.ip(), &ours) {
+                ArrivalPath::SameNetwork
+            } else {
+                ArrivalPath::Internet
+            };
+            (Some(path), Some(addr.ip().to_canonical().to_string()))
+        }
+        _ => (None, None),
+    };
+    Delivery {
+        peer: peer_id.into(),
+        path,
+        address,
+    }
+}
+
+/// Whether a direct path stays on this device's network. A private address does.
+/// A public IPv6 address does when it shares this device's /64 prefix, the part
+/// every device on one network has in common. A public IPv4 address does when
+/// it's this device's own: both are behind the same router. `ours` are this
+/// device's addresses, as iroh knows them.
+fn on_this_network(remote: IpAddr, ours: &[IpAddr]) -> bool {
+    match remote.to_canonical() {
+        IpAddr::V4(v4) => {
+            v4.is_private()
+                || v4.is_link_local()
+                || v4.is_loopback()
+                || ours.iter().any(|o| o.to_canonical() == IpAddr::V4(v4))
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unicast_link_local()
+                || v6.is_unique_local()
+                || ours.iter().any(|o| match o.to_canonical() {
+                    IpAddr::V6(o) => o.segments()[..4] == v6.segments()[..4],
+                    IpAddr::V4(_) => false,
+                })
         }
     }
 }
@@ -407,7 +471,11 @@ fn batches(rows: Vec<Row>) -> Vec<Vec<Row>> {
     let mut out: Vec<Vec<Row>> = vec![];
     let mut size = 0;
     for row in rows {
-        let len = row.text.as_ref().map_or(0, |t| t.len()) + 200;
+        // An image row carries its bytes, so it fills a message on its own.
+        let len = row.text.as_ref().map_or(0, |t| t.len())
+            + row.image.as_ref().map_or(0, |i| i.len())
+            + row.thumb.as_ref().map_or(0, |t| t.len())
+            + 200;
         if out.is_empty() || size + len > BATCH_BYTES {
             out.push(vec![]);
             size = 0;
@@ -690,6 +758,13 @@ mod tests {
             (incoming.text.as_str(), incoming.device.as_str()),
             ("from a", "Mac A")
         );
+        // Both nodes are on this machine, so the clip never left this network.
+        let id = b.inner.store.search("from a".into(), 1).unwrap()[0].id;
+        let arrivals = b.inner.store.arrivals(id).unwrap();
+        assert_eq!(arrivals.len(), 1);
+        assert_eq!(arrivals[0].from, "Mac A");
+        assert_eq!(arrivals[0].path, Some(ArrivalPath::SameNetwork));
+        assert!(arrivals[0].address.is_some());
 
         b.inner.store.add("from b".into(), None).unwrap();
         wait_until("a to get b's clip", || texts(&a) == ["from b", "from a"]);
@@ -742,6 +817,39 @@ mod tests {
         );
     }
 
+    /// On an iPhone the share sheet and the Control Center button run in their own
+    /// processes, writing to the app's database. The app has to send those clips too.
+    #[test]
+    fn clips_another_process_writes_reach_peers() {
+        let path = std::env::temp_dir().join(format!("holt-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let phone = Node::start_with(
+            Store::open(path.to_string_lossy().into()).unwrap(),
+            "iPhone".into(),
+            true,
+        )
+        .unwrap();
+        let mac = node("Mac");
+        phone
+            .inner
+            .memory
+            .add_endpoint_info(mac.inner.endpoint.addr());
+        mac.inner
+            .memory
+            .add_endpoint_info(phone.inner.endpoint.addr());
+        phone.pair(mac.device_id(), mac.start_pairing()).unwrap();
+        wait_until("phone and mac to connect", || {
+            mac.devices().unwrap().iter().any(|d| d.online)
+        });
+
+        let extension = Store::open(path.to_string_lossy().into()).unwrap();
+        extension.add("from the share sheet".into(), None).unwrap();
+        wait_until("mac to get the extension's clip", || {
+            texts(&mac) == ["from the share sheet"]
+        });
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn unpaired_devices_get_nothing() {
         let (a, b) = (node("Mac A"), node("Stranger"));
@@ -785,6 +893,46 @@ mod tests {
         wait_until("b to get the clip", || {
             texts(&b) == ["over the real network"]
         });
+    }
+
+    #[test]
+    fn tells_this_network_from_the_internet() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let home_v6 = ip("2a01:cb01:4030:fc35::9");
+        let home_v4 = ip("86.12.3.4");
+        let ours = [ip("192.168.1.10"), home_v4, home_v6];
+        let same = |s: &str| on_this_network(ip(s), &ours);
+
+        // Private, link-local, unique-local and loopback addresses never leave a network.
+        for local in [
+            "192.168.1.20",
+            "10.0.0.5",
+            "172.20.1.1",
+            "169.254.3.3",
+            "fe80::1",
+            "fd12::1",
+            "::1",
+        ] {
+            assert!(same(local), "{local}");
+        }
+        // IPv4 written as IPv6 counts as the IPv4 inside.
+        assert!(same("::ffff:192.168.1.20"));
+        // The same /64 prefix as this Mac: another device on this Wi-Fi.
+        assert!(same("2a01:cb01:4030:fc35:7529:8c33:12b:3986"));
+        // This Mac's own public IPv4: both behind the same router.
+        assert!(same("86.12.3.4"));
+
+        // A phone on mobile data, another home, a VPN address: across the internet.
+        for remote in [
+            "2a01:cb01:4030:fc36::1",
+            "2a01:e0a:1::5",
+            "86.12.3.5",
+            "100.101.1.1",
+        ] {
+            assert!(!same(remote), "{remote}");
+        }
+        // Without knowing this Mac's addresses, a public one is the internet.
+        assert!(!on_this_network(home_v6, &[]));
     }
 
     #[test]

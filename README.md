@@ -27,7 +27,8 @@
 ## What it does
 
 - **Find anything you copied.** Press ⇧⌘V and start typing. Every word has to match, so `ssh 10.0` finds that one command from last week.
-- **Paste where you were.** Pick a clip and press return. Holt pastes it into the app you were typing in.
+- **Paste where you were.** Pick a clip and press return. Holt pastes it into the app you were typing in. Or drag a clip out of the list into any field.
+- **Images too.** Screenshots and copied pictures, up to 10 MB each. The text in them is read on your Mac, so `invoice 2026` finds the screenshot of the invoice.
 - **Pin what you reuse.** Pinned clips stay at the top and never expire.
 - **On every Mac.** Pair your Macs once. Copy on one, press ⌘V on the other a second later.
 - **Private.** No account and no Holt server. Copies that password managers mark as private are never recorded.
@@ -38,7 +39,7 @@
 | --- | --- | --- | --- | --- |
 | History and search | Yes | No | Yes | Yes |
 | Sync between Macs | Yes, over any network | Last copy only, devices nearby | No | Yes, through iCloud |
-| iPhone | Coming | Yes | No | Yes |
+| iPhone | Beta | Yes | No | Yes |
 | Open source | Yes | No | Yes | No |
 | Price | Free | Free | Free | Subscription |
 
@@ -51,6 +52,8 @@ brew install --cask snowztech/tap/holt
 ```
 
 It needs macOS 14 or later on Apple Silicon. Releases are signed and notarized, so macOS opens Holt without warnings, and Holt updates itself from the menu bar menu.
+
+Holt for iPhone is in beta: [join it on TestFlight](https://testflight.apple.com/join/vREWnfrC).
 
 To build from source instead, you need Xcode and Rust ([rustup.rs](https://rustup.rs)):
 
@@ -66,18 +69,9 @@ On first launch, a short checklist walks you through setup:
 - **Paste for you.** Optional. Accessibility access lets Holt paste into the app you're in. Without it, Holt copies the clip and you press ⌘V.
 - **Open at login.** Recommended, so Holt never misses a copy after a restart.
 
-## Keyboard shortcuts
+## Docs
 
-| Key | What it does |
-| --- | --- |
-| ⇧⌘V | Open Holt. Change it in Settings → General. |
-| ↑ ↓ | Move through clips |
-| ↩ | Paste the clip |
-| ⌘1 to ⌘9 | Paste one of the first nine. Hold ⌘ to see the numbers. |
-| ⌘P | Pin or unpin |
-| ⌘O | Open a link |
-| ⌘⌫ | Delete, here and on your other Macs |
-| esc | Close |
+[holt.snowztech.com/docs](https://holt.snowztech.com/docs) covers everything Holt does: search and paste, pins, images, sync, Raycast and Alfred, settings, keyboard shortcuts and troubleshooting.
 
 ## Sync between Macs
 
@@ -91,26 +85,14 @@ After that the Macs stay connected, and Holt never uses Bluetooth:
 
 Copies, pins and deletes all sync. A clip copied on another Mac in the last 2 minutes goes straight onto this Mac's clipboard, and a small notice says where it came from.
 
-Under the hood, the connection is [iroh](https://iroh.computer). The pairing code is checked with SPAKE2, so someone on the same network gets one guess per try, and pairing stops after 5 wrong codes.
+Under the hood, the connection is [iroh](https://iroh.computer). The pairing code is checked with SPAKE2, so someone on the same network gets one guess per try, and pairing stops after 5 wrong codes. [How Holt works](docs/architecture.md) walks through the whole flow.
 
 ## Privacy
 
-- Your history stays on your Macs, in `~/Library/Application Support/Holt/holt.db`. There's no Holt account and no analytics.
+- Your history stays on your Macs, in `~/Library/Application Support/Holt/holt.db`, with images next to it in `images/`. There's no Holt account and no analytics. Text in images is read on your Mac with Apple's recognizer, never sent anywhere.
 - Copies that password managers mark as private are never recorded. In Settings → History you can add apps whose copies Holt ignores.
 - Sync is end-to-end encrypted, and only Macs you paired can connect.
 - To find each other across networks, your Macs use iroh's public discovery and relay servers. Those see your Macs' network addresses, never your clips.
-
-## Troubleshooting
-
-**Holt doesn't record what I copy.** Set Holt to Always Allow in System Settings → Privacy & Security → Paste from Other Apps. While it's missing, the menu bar menu shows Allow Clipboard Access.
-
-**Picking a clip copies it but doesn't paste.** Turn on Holt in System Settings → Privacy & Security → Accessibility. Holt Settings → General shows whether it's on.
-
-**My other Mac doesn't show up under Nearby.** Both Macs need Holt Settings → Devices open and the same network. Also check that Holt is allowed in System Settings → Privacy & Security → Local Network.
-
-**The code didn't match.** Type the code shown on the other Mac, not this one. After 5 wrong codes that code stops working: close Settings on the other Mac and open Devices again for a new one.
-
-**Uninstall.** `brew uninstall --zap --cask holt`. Without Homebrew, quit Holt, drag it to the Trash and delete `~/Library/Application Support/Holt`.
 
 ## Meet Skip
 
@@ -123,8 +105,8 @@ Skip does the same with what you copy: keeps it safe, and skips it across to you
 - [x] Clipboard history on the Mac
 - [x] Sync between Macs
 - [x] Signed download and Homebrew
-- [ ] iPhone app
-- [ ] Images, and search for the text inside screenshots
+- [ ] iPhone app, in beta on [TestFlight](https://testflight.apple.com/join/vREWnfrC)
+- [x] Images, and search for the text inside screenshots
 - [ ] Windows and Linux
 
 ## Contributing
